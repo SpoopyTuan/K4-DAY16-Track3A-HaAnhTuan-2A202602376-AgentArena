@@ -79,16 +79,64 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+
+        observed = ctx.observed_text or ""
+        valid_claims = []
+        abstained = False
+
+        for claim in claims:
+            text = claim.get("text", "")
+            if text and text in observed:
+                valid_claims.append(claim)
+                continue
+
+            split_res = self._split_fused(text, ctx)
+            if split_res:
+                c1, c2 = split_res
+                valid_claims.extend([c1, c2])
+                abstained = True
+
+        if not valid_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ để trả lời."
+            return report
+
+        if abstained:
+            report["abstain"] = True
+
+        report["claims"] = valid_claims
+        report["citations"] = sorted({c["doc_id"] for c in valid_claims if c.get("doc_id")})
+        return report
+
+    def _split_fused(self, text: str, ctx) -> tuple[dict, dict] | None:
+        if not text or not ctx.corpus:
+            return None
+        joins = (" và ", " còn ", " nhưng ", " trong khi ", "; ", ", còn ")
+        for join in joins:
+            pos = text.find(join)
+            while pos > 0:
+                left = text[:pos].strip()
+                right = text[pos + len(join):].strip()
+                if left and right:
+                    left_doc = self._find_doc_for_text(left, ctx)
+                    right_doc = self._find_doc_for_text(right, ctx)
+                    if left_doc and right_doc and left_doc != right_doc:
+                        return (
+                            {"text": left, "doc_id": left_doc},
+                            {"text": right, "doc_id": right_doc},
+                        )
+                pos = text.find(join, pos + 1)
+        return None
+
+    def _find_doc_for_text(self, text: str, ctx) -> str | None:
+        observed = ctx.observed_text or ""
+        for doc in ctx.corpus.docs:
+            if doc.body and doc.body in observed:
+                if any(text == line for line in doc.body.splitlines()):
+                    return doc.doc_id
+        return None
